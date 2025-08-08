@@ -54,9 +54,11 @@ This project identifies NBA player archetypes by:
 ## Visualizations
 
 - **PCA Plot:** 2D scatter of player embeddings colored by archetype.
-- **Representative Players:** Bar plots of players closest to cluster centers.
-- **Distinctive Players:** Bar plots of players most unique to each archetype.
+![Perceptron Result](https://raw.githubusercontent.com/shrivasshankar/images/main/PCASCATTERPLOT.png))
+- **Representative Players:** Bar plots of players closest to cluster centers and bar plots of players most unique to each archetype.
+![Perceptron Result](https://raw.githubusercontent.com/shrivasshankar/images/main/ClusterBarPlot.png)).
 - **Interactive 3D UMAP:** Rotatable and zoomable plot with player names and cluster colors.
+![Perceptron Result](https://raw.githubusercontent.com/shrivasshankar/images/main/3dModelPlot.png))
 
 ---
 
