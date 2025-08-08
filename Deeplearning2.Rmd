@@ -1,0 +1,337 @@
+---
+title: "NBA Player Archetype Clustering with Neural Networks"
+author: Shrivas Shankar
+date: 8/8/2025
+  
+output: rmdformats::robobook
+---
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r}
+#Preprocessing can take 15-30 min to run depending on the PC 
+library(torch)
+library(dplyr)
+library(ggplot2)
+library(stats)  # for kmeans
+library(ggrepel)
+library(patchwork)
+library(tidyr)
+library(purrr)
+library(uwot)
+library(plotly)
+# Set global seed for reproducibility
+set.seed(67)
+
+# Set seed for torch (PyTorch)
+torch_manual_seed(67)
+
+# Load data
+player_stats <- read.csv("~/Desktop/Stat 240/data/PlayerStatistics.csv")
+
+# Define feature columns
+feature_cols <- c(
+  "points", "assists", "reboundsOffensive", "reboundsDefensive",
+  "steals", "blocks", "turnovers", "fieldGoalsAttempted",
+  "fieldGoalsMade", "fieldGoalsPercentage", "threePointersAttempted",
+  "threePointersMade", "threePointersPercentage", "freeThrowsAttempted",
+  "freeThrowsMade", "freeThrowsPercentage", "numMinutes"
+)
+
+# Filter and extract features
+player_stats_filtered <- player_stats %>% 
+  filter(complete.cases(select(., all_of(feature_cols))))
+features <- player_stats_filtered %>% select(all_of(feature_cols))
+
+# Normalize features
+features_scaled <- scale(features)
+features_mat <- as.matrix(features_scaled)
+
+# Convert to torch tensor
+x <- torch_tensor(features_mat, dtype = torch_float())
+
+# Define autoencoder
+autoencoder <- nn_module(
+  initialize = function(input_dim, embedding_dim) {
+    self$encoder <- nn_sequential(
+      nn_linear(input_dim, 64),
+      nn_relu(),
+      nn_linear(64, embedding_dim)
+    )
+    self$decoder <- nn_sequential(
+      nn_linear(embedding_dim, 64),
+      nn_relu(),
+      nn_linear(64, input_dim)
+    )
+  },
+  forward = function(x) {
+    z <- self$encoder(x)
+    x_recon <- self$decoder(z)
+    list(embedding = z, reconstruction = x_recon)
+  }
+)
+
+input_dim <- ncol(features_mat)
+embedding_dim <- 8
+
+# Instantiate and train model
+model <- autoencoder(input_dim = input_dim, embedding_dim = embedding_dim)
+optimizer <- optim_adam(model$parameters, lr = 0.001)
+loss_fn <- nn_mse_loss()
+num_epochs <- 10
+batch_size <- 128
+num_batches <- ceiling(nrow(features_mat) / batch_size)
+
+for (epoch in 1:num_epochs) {
+  model$train()
+  total_loss <- 0
+  for (batch in 1:num_batches) {
+    start_idx <- (batch - 1) * batch_size + 1
+    end_idx <- min(batch * batch_size, nrow(features_mat))
+    batch_x <- x[start_idx:end_idx, ]
+    optimizer$zero_grad()
+    output <- model(batch_x)
+    loss <- loss_fn(output$reconstruction, batch_x)
+    loss$backward()
+    optimizer$step()
+    total_loss <- total_loss + loss$item()
+  }
+}
+
+# Get embeddings
+model$eval()
+with_no_grad({
+  embeddings <- model$encoder(x)
+})
+
+# Convert embeddings to matrix
+embeddings_mat <- as.array(embeddings)
+colnames(embeddings_mat) <- paste0("V", 1:ncol(embeddings_mat))
+
+# Cluster embeddings
+set.seed(67)
+k <- 7
+clusters <- kmeans(embeddings_mat, centers = k)
+
+# Attach cluster labels
+player_clusters <- data.frame(embeddings_mat)
+player_clusters$cluster <- as.factor(clusters$cluster)
+
+# Perform PCA
+pca_result <- prcomp(embeddings_mat, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x[, 1:2])
+colnames(pca_scores) <- c("PC1", "PC2")
+pca_scores$cluster <- clusters$cluster
+
+# Combine player names and clusters
+player_clusters_full <- player_stats_filtered %>%
+  select(firstName, lastName, personId) %>%
+  bind_cols(
+    as.data.frame(embeddings_mat),
+    cluster = clusters$cluster
+  ) %>%
+  mutate(fullName = paste(firstName, lastName))
+
+# --- Compute 3D UMAP embeddings ---
+set.seed(67)
+umap_3d <- umap(embeddings_mat, n_neighbors = 15, n_components = 3, metric = "euclidean")
+umap_df <- as.data.frame(umap_3d)
+colnames(umap_df) <- c("UMAP1", "UMAP2", "UMAP3")
+umap_df$cluster <- as.factor(clusters$cluster)
+umap_df$player <- player_clusters_full$fullName
+
+# Function to find top representative players
+find_top_players <- function(cluster_num, n = 5) {
+  cluster_data <- embeddings_mat[clusters$cluster == cluster_num, ]
+  center <- clusters$centers[cluster_num, ]
+  distances <- apply(cluster_data, 1, function(x) sqrt(sum((x - center)^2)))
+  top_indices <- order(distances)[1:n]
+  cluster_players <- player_clusters_full %>% filter(cluster == cluster_num)
+  top_players <- cluster_players[top_indices, ] %>% select(fullName, personId, cluster)
+  data.frame(Player = top_players$fullName, ID = top_players$personId, Distance = distances[top_indices])
+}
+
+# Function to find most distinctive players
+find_extreme_players <- function(cluster_num, n = 5) {
+  cluster_data <- embeddings_mat[clusters$cluster == cluster_num, ]
+  other_centers <- clusters$centers[-cluster_num, ]
+  distances <- apply(cluster_data, 1, function(x) mean(apply(other_centers, 1, function(y) sqrt(sum((x - y)^2)))))
+  extreme_indices <- order(distances, decreasing = TRUE)[1:n]
+  cluster_players <- player_clusters_full %>% filter(cluster == cluster_num)
+  extreme_players <- cluster_players[extreme_indices, ] %>% select(fullName, personId, cluster)
+  data.frame(Player = extreme_players$fullName, ID = extreme_players$personId, Distinctiveness = distances[extreme_indices])
+}
+
+# Get top and distinctive players
+top_players_list <- map(1:k, function(i) find_top_players(i))
+extreme_players_list <- map(1:k, function(i) find_extreme_players(i))
+
+```
+
+```{r}
+library(ggplot2)
+library(plotly)
+library(dplyr)
+library(patchwork)  # for plot_layout and plot_annotation
+
+# Your cluster labels named by cluster number
+cluster_labels <- c(
+  "1" = "Versatile Role Player (Brook Lopez)",
+  "2" = "Sharp Shooters (Steve Nash)",
+  "3" = "Star Scorers (James Harden)",
+  "4" = "Dominant Bigs (Kevin Garnett)",
+  "5" = "Bench Players (Adrian Griffin)",
+  "6" = "Supporting Guards (Georges Niang)",
+  "7" = "Energy Bigs (Aaron Gordon)"
+)
+
+# Define a manual color vector (matching the "Set1" palette colors)
+manual_colors <- c(
+  "Versatile Role Player (Brook Lopez)" = "#E41A1C",  # red
+  "Sharp Shooters (Steve Nash)" = "#377EB8",          # blue
+  "Star Scorers (James Harden)" = "#4DAF4A",          # green
+  "Dominant Bigs (Kevin Garnett)" = "#984EA3",         # purple
+  "Bench Players (Adrian Griffin)" = "#FF7F00",       # orange
+  "Supporting Guards (Georges Niang)" = "#FFFF33",    # yellow
+  "Energy Bigs (Aaron Gordon)" = "#A65628"            # brown
+)
+
+# Make sure cluster_label columns are factors with levels matching manual_colors
+pca_scores$cluster_label <- factor(
+  cluster_labels[as.character(pca_scores$cluster)],
+  levels = names(manual_colors)
+)
+
+top_players_plot <- bind_rows(top_players_list, .id = "cluster") %>%
+  group_by(cluster) %>%
+  slice_head(n = 3) %>%
+  ungroup() %>%
+  mutate(cluster_label = factor(cluster_labels[cluster], levels = names(manual_colors))) %>%
+  ggplot(aes(reorder(Player, -Distance), Distance, fill = cluster_label)) +
+  geom_col() +
+  facet_wrap(~cluster_label, scales = "free_x", nrow = 1) +
+  scale_fill_manual(values = manual_colors) +
+  labs(title = "Most Representative Players per Cluster", x = "", y = "Distance to Cluster Center") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    strip.text = element_blank(),   # THIS removes facet strip labels
+    legend.position = "none"
+  )
+
+distinctive_players_plot <- bind_rows(extreme_players_list, .id = "cluster") %>%
+  group_by(cluster) %>%
+  slice_head(n = 3) %>%
+  ungroup() %>%
+  mutate(cluster_label = factor(cluster_labels[cluster], levels = names(manual_colors))) %>%
+  ggplot(aes(reorder(Player, -Distinctiveness), Distinctiveness, fill = cluster_label)) +
+  geom_col() +
+  facet_wrap(~cluster_label, scales = "free_x", nrow = 1) +
+  scale_fill_manual(values = manual_colors) +
+  labs(title = "Most Distinctive Players per Cluster", x = "", y = "Distance from Other Clusters") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    strip.text = element_blank(),   # THIS removes facet strip labels
+    legend.position = "none"
+  )
+
+
+# PCA plot with manual colors and factor cluster_label
+pca_plot <- ggplot(pca_scores, aes(PC1, PC2, color = cluster_label)) +
+  geom_point(alpha = 0.4, size = 1.5) +
+  scale_color_manual(values = manual_colors, name = "Cluster Type") +
+  labs(
+    title = "Player Archetypes in PCA Space",
+    subtitle = "Each cluster represents distinct play styles, PC1 and PC2 are based on stats learned by the neural network",
+    x = x_lab,
+    y = y_lab
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 8),
+    legend.key.size = unit(0.5, "cm")
+  )
+
+# Combine static visualizations
+final_viz <- (pca_plot | (top_players_plot / distinctive_players_plot)) +
+  plot_layout(widths = c(2, 1), heights = c(1, 0.7)) +
+  plot_annotation(
+    title = "NBA Player Archetype Analysis",
+    subtitle = "Autoencoder Embeddings with k-means Clustering",
+    theme = theme(plot.title = element_text(size = 18, face = "bold"),
+                  plot.subtitle = element_text(size = 12))
+  )
+
+
+
+```
+
+
+
+
+```{r}
+# Convert cluster column to character for mapping to labels
+umap_df$cluster <- as.character(umap_df$cluster)
+
+# Map cluster IDs to descriptive labels, keeping the order consistent
+umap_df$cluster_label <- factor(
+  cluster_labels[umap_df$cluster],
+  levels = cluster_labels
+)
+
+# Randomly sample 200,000 rows to reduce plot size and improve performance
+set.seed(67)
+sampled_indices <- sample(nrow(umap_df), 200000)
+umap_sampled <- umap_df[sampled_indices, ]
+
+umap_3d_plot <- plot_ly(
+  data = umap_sampled,
+  x = ~UMAP1,
+  y = ~UMAP2,
+  z = ~UMAP3,
+  color = ~cluster_label,
+  colors = manual_colors,
+  text = ~player,
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(size = 4, opacity = 0.7)
+) %>%
+  layout(
+    title = list(
+      text = paste0(
+        "3D UMAP Visualization of Player Embeddings (Sampled 200k)<br>",
+        "<sup>Hover over points to see player names. Colors show player archetype clusters.<br><br>",
+        "<i>Note: Clustering is based on neural network embeddings and may not be 100% accurate.</i><br>",
+        "<i>Archetypes are based on average statistics from clustering results.</i></sup>"
+      ),
+      x = 0.5
+    ),
+    scene = list(
+      xaxis = list(title = "UMAP1"),
+      yaxis = list(title = "UMAP2"),
+      zaxis = list(title = "UMAP3")
+    ),
+    annotations = list(
+      list(
+        text = "Instructions: Rotate the plot with mouse drag. Zoom with scroll.",
+        xref = "paper",
+        yref = "paper",
+        x = 0,
+        y = -0.1,
+        showarrow = FALSE,
+        font = list(size = 12)
+      )
+    )
+  )
+
+umap_3d_plot
+
+
+```
+
